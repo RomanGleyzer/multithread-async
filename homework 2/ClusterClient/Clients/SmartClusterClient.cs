@@ -1,23 +1,58 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using log4net;
 
-namespace ClusterClient.Clients
+namespace ClusterClient.Clients;
+
+public class SmartClusterClient(string[] replicaAddresses) : ClusterClientBase(replicaAddresses)
 {
-    public class SmartClusterClient : ClusterClientBase
+    public override async Task<string> ProcessRequestAsync(string query, TimeSpan timeout)
     {
-        public SmartClusterClient(string[] replicaAddresses) : base(replicaAddresses)
+        if (ReplicaAddresses == null || ReplicaAddresses.Length == 0)
+            throw new InvalidOperationException("Реплика адресов не указана");
+
+        var perReplicaTimeout = TimeSpan.FromTicks(timeout.Ticks / ReplicaAddresses.Length);
+        var firstSuccess = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var remaining = ReplicaAddresses.Length;
+        Exception lastError = null;
+
+        foreach (var uri in ReplicaAddresses)
         {
+            var webRequest = CreateRequest(uri + "?query=" + query);
+
+            Log.InfoFormat($"Обработка {webRequest.RequestUri}");
+
+            var task = ProcessRequestAsync(webRequest);
+
+            _ = task.ContinueWith(t =>
+            {
+                if (t.Status == TaskStatus.RanToCompletion)
+                {
+                    firstSuccess.TrySetResult(t.Result);
+                    return;
+                }
+
+                var ex = t.Exception?.GetBaseException() ?? new TaskCanceledException(t);
+                Interlocked.Exchange(ref lastError, ex);
+
+                if (Interlocked.Decrement(ref remaining) == 0)
+                    firstSuccess.TrySetException(Volatile.Read(ref lastError) ??
+                                                 new Exception(
+                                                     "Не удалось получить успешный ответ ни от одной реплики"));
+            }, TaskContinuationOptions.ExecuteSynchronously);
+
+            var completed = await Task.WhenAny(firstSuccess.Task, Task.Delay(perReplicaTimeout));
+            if (completed == firstSuccess.Task)
+                return await firstSuccess.Task;
         }
 
-        public override Task<string> ProcessRequestAsync(string query, TimeSpan timeout)
-        {
-            throw new NotImplementedException();
-        }
+        if (firstSuccess.Task.IsCompleted)
+            return await firstSuccess.Task;
 
-        protected override ILog Log => LogManager.GetLogger(typeof(SmartClusterClient));
+        throw new TimeoutException();
     }
+
+    protected override ILog Log => LogManager.GetLogger(typeof(SmartClusterClient));
 }
