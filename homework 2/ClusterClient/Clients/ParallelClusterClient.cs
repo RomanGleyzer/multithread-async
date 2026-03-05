@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Threading;
 using System.Threading.Tasks;
 using log4net;
 
@@ -11,26 +12,41 @@ public class ParallelClusterClient(string[] replicaAddresses) : ClusterClientBas
         if (ReplicaAddresses == null || ReplicaAddresses.Length == 0)
             throw new InvalidOperationException("Реплика адресов не указана");
 
-        var tasks = new Task<string>[ReplicaAddresses.Length];
+        var firstSuccess = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        for (var i = 0; i < ReplicaAddresses.Length; i++)
+        var remaining = ReplicaAddresses.Length;
+        Exception? lastError = null;
+
+        foreach (var uri in ReplicaAddresses)
         {
-            var uri = ReplicaAddresses[i];
             var webRequest = CreateRequest(uri + "?query=" + query);
-
             Log.InfoFormat($"Обработка {webRequest.RequestUri}");
 
-            tasks[i] = ProcessRequestAsync(webRequest);
+            var task = ProcessRequestAsync(webRequest);
+
+            _ = task.ContinueWith(t =>
+            {
+                if (t.Status == TaskStatus.RanToCompletion)
+                {
+                    firstSuccess.TrySetResult(t.Result);
+                    return;
+                }
+
+                var ex = t.Exception?.GetBaseException() ?? new TaskCanceledException(t);
+                lastError = ex;
+                _ = t.Exception;
+
+                if (Interlocked.Decrement(ref remaining) == 0)
+                    firstSuccess.TrySetException(lastError ??
+                                                 new Exception("Не удалось получить ответ ни от одной реплики"));
+            }, TaskContinuationOptions.ExecuteSynchronously);
         }
 
-        var anyReplicaTask = Task.WhenAny(tasks);
-        var timeoutTask = Task.Delay(timeout);
-
-        var completed = await Task.WhenAny(anyReplicaTask, timeoutTask);
-        if (ReferenceEquals(completed, timeoutTask))
+        var completed = await Task.WhenAny(firstSuccess.Task, Task.Delay(timeout));
+        if (completed != firstSuccess.Task)
             throw new TimeoutException();
 
-        return await anyReplicaTask.Result;
+        return await firstSuccess.Task;
     }
 
     protected override ILog Log => LogManager.GetLogger(typeof(ParallelClusterClient));
