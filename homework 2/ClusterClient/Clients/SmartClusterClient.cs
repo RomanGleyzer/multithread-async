@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
 using log4net;
@@ -12,6 +13,8 @@ public class SmartClusterClient(string[] replicaAddresses) : ClusterClientBase(r
         if (ReplicaAddresses == null || ReplicaAddresses.Length == 0)
             throw new InvalidOperationException("Реплика адресов не указана");
 
+        var sw = Stopwatch.StartNew();
+
         var perReplicaTimeout = TimeSpan.FromTicks(timeout.Ticks / ReplicaAddresses.Length);
         var firstSuccess = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -21,7 +24,6 @@ public class SmartClusterClient(string[] replicaAddresses) : ClusterClientBase(r
         foreach (var uri in ReplicaAddresses)
         {
             var webRequest = CreateRequest(uri + "?query=" + query);
-
             Log.InfoFormat($"Обработка {webRequest.RequestUri}");
 
             var task = ProcessRequestAsync(webRequest);
@@ -38,12 +40,26 @@ public class SmartClusterClient(string[] replicaAddresses) : ClusterClientBase(r
                 Interlocked.Exchange(ref lastError, ex);
 
                 if (Interlocked.Decrement(ref remaining) == 0)
-                    firstSuccess.TrySetException(Volatile.Read(ref lastError) ??
-                                                 new Exception(
-                                                     "Не удалось получить успешный ответ ни от одной реплики"));
+                    firstSuccess.TrySetException(
+                        Volatile.Read(ref lastError) ??
+                        new Exception("Не удалось получить успешный ответ ни от одной реплики"));
             }, TaskContinuationOptions.ExecuteSynchronously);
 
-            var completed = await Task.WhenAny(firstSuccess.Task, Task.Delay(perReplicaTimeout));
+            var completed = await Task.WhenAny(firstSuccess.Task, task, Task.Delay(perReplicaTimeout));
+
+            if (completed == firstSuccess.Task)
+                return await firstSuccess.Task;
+
+            if (completed != task) continue;
+
+            if (task.Status == TaskStatus.RanToCompletion)
+                return task.Result;
+        }
+
+        var remainingTotal = timeout - sw.Elapsed;
+        if (remainingTotal > TimeSpan.Zero)
+        {
+            var completed = await Task.WhenAny(firstSuccess.Task, Task.Delay(remainingTotal));
             if (completed == firstSuccess.Task)
                 return await firstSuccess.Task;
         }
