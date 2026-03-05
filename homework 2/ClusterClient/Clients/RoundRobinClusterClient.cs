@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Diagnostics;
 using System.Threading.Tasks;
 using log4net;
 
@@ -11,21 +12,27 @@ public class RoundRobinClusterClient(string[] replicaAddresses) : ClusterClientB
         if (ReplicaAddresses == null || ReplicaAddresses.Length == 0)
             throw new InvalidOperationException("Реплика адресов не указана");
 
-        var perReplicaTimeout = TimeSpan.FromTicks(timeout.Ticks / ReplicaAddresses.Length);
-
+        var sw = Stopwatch.StartNew();
         Exception lastError = null;
 
-        foreach (var uri in ReplicaAddresses)
+        for (var i = 0; i < ReplicaAddresses.Length; i++)
         {
+            var remaining = timeout - sw.Elapsed;
+            if (remaining <= TimeSpan.Zero)
+                break;
+
+            var remainingReplicas = ReplicaAddresses.Length - i;
+            var slice = TimeSpan.FromTicks(remaining.Ticks / remainingReplicas);
+
+            var uri = ReplicaAddresses[i];
             var webRequest = CreateRequest(uri + "?query=" + query);
 
             Log.InfoFormat($"Обработка {webRequest.RequestUri}");
 
             var resultTask = ProcessRequestAsync(webRequest);
-            
-            await Task.WhenAny(resultTask, Task.Delay(perReplicaTimeout));
 
-            if (!resultTask.IsCompleted)
+            var completed = await Task.WhenAny(resultTask, Task.Delay(slice));
+            if (completed != resultTask)
             {
                 _ = resultTask.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
                 continue;
